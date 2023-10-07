@@ -108,8 +108,13 @@ class LlamaConfig(PretrainedConfig):
         self.hidden_act = hidden_act
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
-        self.w_bits = w_bits
-        self.a_bits = a_bits
+        self.w_bits    = w_bits
+        self.a_bits    = a_bits
+        self.kv_bits   = a_bits
+        self.w_per_tensor_quant = True
+        self.a_per_tensor_quant = True
+        self.w_symmetric_quant = False
+        self.a_symmetric_quant = False
         self.use_cache = use_cache
         super().__init__(
             pad_token_id=pad_token_id,

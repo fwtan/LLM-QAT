@@ -48,7 +48,7 @@ from transformers.utils import (
 )
 
 from .configuration_llama import LlamaConfig
-from .utils_quant import QuantizeLinear, SymQuantizer
+from .utils_quant import QuantizeLinear, QuantizerWrapper, QuantizeBMM, SymQuantizer, AsymQuantizer
 
 
 logger = logging.get_logger(__name__)
@@ -110,7 +110,15 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
 
 
 class LlamaRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
+    def __init__(self, 
+        hidden_size, 
+        eps=1e-6, 
+        w_bits=32, 
+        a_bits=32,
+        w_symmetric=False,
+        a_symmetric=False,
+        a_per_tensor_quant=True,
+    ):
         """
         LlamaRMSNorm is equivalent to T5LayerNorm
         """
@@ -118,19 +126,46 @@ class LlamaRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+        self.input_quantizer  = None
+        self.output_quantizer = None
+        self.weight_quantizer = None
+        
+        self.w_bits = w_bits
+        # if w_bits < 32:
+        #     self.weight_quantizer = QuantizerWrapper(w_bits, w_symmetric, True)
+        self.a_bits = a_bits
+        if a_bits < 32:
+            self.input_quantizer  = QuantizerWrapper(a_bits, a_symmetric, a_per_tensor_quant)
+            self.output_quantizer = QuantizerWrapper(a_bits, a_symmetric, a_per_tensor_quant)
+
+    def set_act_scale(self, act_scale):
+        if self.input_quantizer is not None:
+            self.input_quantizer.clip_val = (act_scale['input'][0], act_scale['input'][1])
+        if self.output_quantizer is not None:
+            self.output_quantizer.clip_val = (act_scale['output'][0], act_scale['output'][1])
+        
     def forward(self, hidden_states):
+        if self.input_quantizer is not None:
+            hidden_states = self.input_quantizer(hidden_states)
         variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        # # convert into half-precision if necessary
+        # if self.weight.dtype in [torch.float16, torch.bfloat16]:
+        #     hidden_states = hidden_states.to(self.weight.dtype)
+        hidden_states = hidden_states.to(torch.float16)
+        if self.weight_quantizer is not None:
+            weight = self.weight_quantizer(self.weight)
+        else:
+            weight = self.weight
 
-        # convert into half-precision if necessary
-        if self.weight.dtype in [torch.float16, torch.bfloat16]:
-            hidden_states = hidden_states.to(self.weight.dtype)
-
-        return self.weight * hidden_states
+        out = weight * hidden_states
+        if self.output_quantizer is not None:
+            out = self.output_quantizer(out)
+        return out
 
 
 class LlamaRotaryEmbedding(torch.nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, w_bits=32):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
         self.register_buffer("inv_freq", inv_freq)
@@ -142,15 +177,21 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             device=self.inv_freq.device,
             dtype=self.inv_freq.dtype,
         )
+        self.w_bits = w_bits
 
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
         emb = torch.cat((freqs, freqs), dim=-1)
+        cos_cached = emb.cos()[None, None, :, :]
+        sin_cached = emb.sin()[None, None, :, :]
+        if self.w_bits < 32:
+            cos_cached = SymQuantizer.apply(cos_cached, None, self.w_bits, True)
+            sin_cached = SymQuantizer.apply(sin_cached, None, self.w_bits, True)
         self.register_buffer(
-            "cos_cached", emb.cos()[None, None, :, :], persistent=False
+            "cos_cached", cos_cached, persistent=False
         )
         self.register_buffer(
-            "sin_cached", emb.sin()[None, None, :, :], persistent=False
+            "sin_cached", sin_cached, persistent=False
         )
 
     def forward(self, x, seq_len=None):
@@ -164,12 +205,17 @@ class LlamaRotaryEmbedding(torch.nn.Module):
 
             freqs = torch.einsum("i,j->ij", t, self.inv_freq)
             # Different from paper, but it uses a different permutation in order to obtain the same calculation
-            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos_cached = emb.cos()[None, None, :, :]
+            sin_cached = emb.sin()[None, None, :, :]
+            if self.w_bits < 32:
+                cos_cached = SymQuantizer.apply(cos_cached, None, self.w_bits, True)
+                sin_cached = SymQuantizer.apply(sin_cached, None, self.w_bits, True)
             self.register_buffer(
-                "cos_cached", emb.cos()[None, None, :, :], persistent=False
+                "cos_cached", cos_cached, persistent=False
             )
             self.register_buffer(
-                "sin_cached", emb.sin()[None, None, :, :], persistent=False
+                "sin_cached", sin_cached, persistent=False
             )
 
         return (
@@ -204,15 +250,20 @@ class LlamaMLP(nn.Module):
         hidden_act: str,
         config: LlamaConfig,
     ):
+        super().__init__()
         self.w_bits = config.w_bits
         self.a_bits = config.a_bits
-        super().__init__()
         self.gate_proj = QuantizeLinear(
             hidden_size,
             intermediate_size,
             bias=False,
             w_bits=self.w_bits,
             a_bits=self.a_bits,
+            act_symmetric=config.a_symmetric_quant,
+            weight_symmetric=config.w_symmetric_quant,
+            weight_layerwise=config.w_per_tensor_quant,
+            act_layerwise=config.a_per_tensor_quant,
+            quantize_output=True,
         )
         self.down_proj = QuantizeLinear(
             intermediate_size,
@@ -220,6 +271,11 @@ class LlamaMLP(nn.Module):
             bias=False,
             w_bits=self.w_bits,
             a_bits=self.a_bits,
+            act_symmetric=config.a_symmetric_quant,
+            weight_symmetric=config.w_symmetric_quant,
+            weight_layerwise=config.w_per_tensor_quant,
+            act_layerwise=config.a_per_tensor_quant,
+            quantize_output=False,
         )
         self.up_proj = QuantizeLinear(
             hidden_size,
@@ -227,12 +283,22 @@ class LlamaMLP(nn.Module):
             bias=False,
             w_bits=self.w_bits,
             a_bits=self.a_bits,
+            act_symmetric=config.a_symmetric_quant,
+            weight_symmetric=config.w_symmetric_quant,
+            weight_layerwise=config.w_per_tensor_quant,
+            act_layerwise=config.a_per_tensor_quant,
+            quantize_output=True,
         )
 
         self.act_fn = ACT2FN[hidden_act]
 
     def forward(self, x):
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        y = self.gate_proj(x)
+        y = self.act_fn(y)
+        z = self.up_proj(x)
+        z = y * z
+        z = self.down_proj(z)
+        return z
 
 
 class LlamaAttention(nn.Module):
@@ -247,12 +313,21 @@ class LlamaAttention(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.w_bits = config.w_bits
         self.a_bits = config.a_bits
-
-        self.act_clip_val_k = torch.tensor([-2.0, 2.0])
-        self.act_clip_val_v = torch.tensor([-2.0, 2.0])
-        self.act_quantizer_k = SymQuantizer
-        self.act_quantizer_v = SymQuantizer
         self.kv_bits = config.kv_bits
+
+        self.qk_bmm = QuantizeBMM(
+            self.kv_bits, self.kv_bits, 
+            config.a_symmetric_quant, config.a_symmetric_quant,
+            config.a_per_tensor_quant, config.a_per_tensor_quant, 
+            True
+        )
+
+        self.pv_bmm = QuantizeBMM(
+            self.kv_bits, self.kv_bits, 
+            config.a_symmetric_quant, config.a_symmetric_quant,
+            config.a_per_tensor_quant, config.a_per_tensor_quant, 
+            True
+        )
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -265,6 +340,11 @@ class LlamaAttention(nn.Module):
             bias=False,
             w_bits=self.w_bits,
             a_bits=self.a_bits,
+            act_symmetric=config.a_symmetric_quant,
+            weight_symmetric=config.w_symmetric_quant,
+            weight_layerwise=config.w_per_tensor_quant,
+            act_layerwise=config.a_per_tensor_quant,
+            quantize_output=True,
         )
         self.k_proj = QuantizeLinear(
             self.hidden_size,
@@ -272,6 +352,11 @@ class LlamaAttention(nn.Module):
             bias=False,
             w_bits=self.w_bits,
             a_bits=self.a_bits,
+            act_symmetric=config.a_symmetric_quant,
+            weight_symmetric=config.w_symmetric_quant,
+            weight_layerwise=config.w_per_tensor_quant,
+            act_layerwise=config.a_per_tensor_quant,
+            quantize_output=True,
         )
         self.v_proj = QuantizeLinear(
             self.hidden_size,
@@ -279,6 +364,11 @@ class LlamaAttention(nn.Module):
             bias=False,
             w_bits=self.w_bits,
             a_bits=self.a_bits,
+            act_symmetric=config.a_symmetric_quant,
+            weight_symmetric=config.w_symmetric_quant,
+            weight_layerwise=config.w_per_tensor_quant,
+            act_layerwise=config.a_per_tensor_quant,
+            quantize_output=True,
         )
         self.o_proj = QuantizeLinear(
             self.num_heads * self.head_dim,
@@ -286,9 +376,14 @@ class LlamaAttention(nn.Module):
             bias=False,
             w_bits=self.w_bits,
             a_bits=self.a_bits,
+            act_symmetric=config.a_symmetric_quant,
+            weight_symmetric=config.w_symmetric_quant,
+            weight_layerwise=config.w_per_tensor_quant,
+            act_layerwise=config.a_per_tensor_quant,
+            quantize_output=False,
         )
         self.rotary_emb = LlamaRotaryEmbedding(
-            self.head_dim, max_position_embeddings=self.max_position_embeddings
+            self.head_dim, max_position_embeddings=self.max_position_embeddings, w_bits=self.w_bits
         )
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -317,14 +412,14 @@ class LlamaAttention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        # KV_cache quantization
-        if self.kv_bits < 32:
-            key_states = self.act_quantizer_k.apply(
-                key_states, self.act_clip_val_k, self.kv_bits, False
-            )
-            value_states = self.act_quantizer_v.apply(
-                value_states, self.act_clip_val_v, self.kv_bits, False
-            )
+        # # KV_cache quantization, already handled in the linear projections
+        # if self.kv_bits < 32:
+        #     key_states = self.act_quantizer_k.apply(
+        #         key_states, self.act_clip_val_k, self.kv_bits, False
+        #     )
+        #     value_states = self.act_quantizer_v.apply(
+        #         value_states, self.act_clip_val_v, self.kv_bits, False
+        #     )
         key_states = key_states.view(
             bsz, q_len, self.num_heads, self.head_dim
         ).transpose(1, 2)
@@ -349,9 +444,10 @@ class LlamaAttention(nn.Module):
 
         past_key_value = (key_states, value_states) if use_cache else None
 
-        attn_weights = torch.matmul(
-            query_states, key_states.transpose(2, 3)
-        ) / math.sqrt(self.head_dim)
+        # attn_weights = torch.matmul(
+        #     query_states, key_states.transpose(2, 3)
+        # ) / math.sqrt(self.head_dim)
+        attn_weights = self.qk_bmm(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -374,7 +470,8 @@ class LlamaAttention(nn.Module):
             attn_weights, dim=-1, dtype=torch.float32
         ).to(query_states.dtype)
 
-        attn_output = torch.matmul(attn_weights, value_states)
+        # attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = self.pv_bmm(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -404,9 +501,21 @@ class LlamaDecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             config=config,
         )
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = LlamaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps,
+            w_bits=config.w_bits,
+            a_bits=config.a_bits,
+            w_symmetric=config.w_symmetric_quant,
+            a_symmetric=config.a_symmetric_quant,
+            a_per_tensor_quant=config.a_per_tensor_quant,
+        )
         self.post_attention_layernorm = LlamaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps,
+            w_bits=config.w_bits,
+            a_bits=config.a_bits,
+            w_symmetric=config.w_symmetric_quant,
+            a_symmetric=config.a_symmetric_quant,
+            a_per_tensor_quant=config.a_per_tensor_quant,
         )
 
     def forward(
