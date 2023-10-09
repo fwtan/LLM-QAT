@@ -84,6 +84,7 @@ class Evaluator:
 parser = argparse.ArgumentParser()
 parser.add_argument('--hf_path', type=str, default='checkpoints/llama/2B_smoothed', help='path of the hf model')
 parser.add_argument('--stat_path', type=str, default='checkpoints/llama/2B_smoothed/act_scales_for_quant.pth', help='path of the act stat')
+parser.add_argument("--bitwidths", nargs='+', default=[4,8,8], type=int)
 args = parser.parse_args()
 
 
@@ -103,9 +104,9 @@ def main():
     hf_device = 'cuda:0'
     hf_config = LlamaConfig.from_pretrained(args.hf_path)
 
-    hf_config.w_bits  = 4
-    hf_config.a_bits  = 8
-    hf_config.kv_bits = 8
+    hf_config.w_bits  = args.bitwidths[0]
+    hf_config.a_bits  = args.bitwidths[1]
+    hf_config.kv_bits = args.bitwidths[2]
     
     model_hf = LlamaForCausalLMQuant.from_pretrained(pretrained_model_name_or_path=args.hf_path, config=hf_config, torch_dtype=torch.float32, low_cpu_mem_usage=True, device_map=hf_device)
     print_model_size(model_hf, True)
