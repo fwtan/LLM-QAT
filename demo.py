@@ -83,7 +83,6 @@ class Evaluator:
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--hf_path', type=str, default='checkpoints/llama/2B_smoothed', help='path of the hf model')
-parser.add_argument('--stat_path', type=str, default='checkpoints/llama/2B_smoothed/act_scales_for_quant.pth', help='path of the act stat')
 parser.add_argument("--bitwidths", nargs='+', default=[4,8,8], type=int)
 args = parser.parse_args()
 
@@ -110,7 +109,7 @@ def main():
     
     model_hf = LlamaForCausalLMQuant.from_pretrained(pretrained_model_name_or_path=args.hf_path, config=hf_config, torch_dtype=torch.float32, low_cpu_mem_usage=True, device_map=hf_device)
     print_model_size(model_hf, True)
-    act_stat = torch.load(args.stat_path)
+    act_stat = torch.load(os.path.join(args.hf_path, 'act_scales_for_quant.pth'))
 
     for name, m in model_hf.named_modules():
         if isinstance(m, (QuantizeLinear, QuantizeBMM, LlamaRMSNorm)):
