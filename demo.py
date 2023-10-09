@@ -103,7 +103,7 @@ def main():
     hf_device = 'cuda:0'
     hf_config = LlamaConfig.from_pretrained(args.hf_path)
 
-    hf_config.w_bits  = 8
+    hf_config.w_bits  = 4
     hf_config.a_bits  = 8
     hf_config.kv_bits = 8
     
@@ -117,8 +117,8 @@ def main():
             if 'down_proj' in name:
                 if m.input_quantizer is not None:
                     m.input_quantizer.bitwidth = 16
-                if m.weight_quantizer is not None:
-                    m.weight_quantizer.bitwidth = 16
+                # if m.weight_quantizer is not None:
+                #     m.weight_quantizer.bitwidth = 16
                 if m.output_quantizer is not None:
                     m.output_quantizer.bitwidth = 16
             if 'layernorm' in name:

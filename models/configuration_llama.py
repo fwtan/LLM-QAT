@@ -111,7 +111,7 @@ class LlamaConfig(PretrainedConfig):
         self.w_bits    = w_bits
         self.a_bits    = a_bits
         self.kv_bits   = a_bits
-        self.w_per_tensor_quant = True
+        self.w_per_tensor_quant = False
         self.a_per_tensor_quant = True
         self.w_symmetric_quant = False
         self.a_symmetric_quant = False
