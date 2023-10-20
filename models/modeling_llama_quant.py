@@ -140,9 +140,9 @@ class LlamaRMSNorm(nn.Module):
 
     def set_act_scale(self, act_scale):
         if self.input_quantizer is not None:
-            self.input_quantizer.clip_val = (act_scale['input'][0], act_scale['input'][1])
+            self.input_quantizer.clip_val = torch.tensor([act_scale['input'][0], act_scale['input'][1]]).to(torch.float32).to(self.weight.device)
         if self.output_quantizer is not None:
-            self.output_quantizer.clip_val = (act_scale['output'][0], act_scale['output'][1])
+            self.output_quantizer.clip_val = torch.tensor([act_scale['output'][0], act_scale['output'][1]]).to(torch.float32).to(self.weight.device)
         
     def forward(self, hidden_states):
         if self.input_quantizer is not None:
